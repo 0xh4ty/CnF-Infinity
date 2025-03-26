@@ -291,7 +291,7 @@ impl App for MyApp {
                 i += 1;
             }
             let mut override_style = ctx.style().as_ref().clone();
-            override_style.spacing.item_spacing.y = 8.0;
+            override_style.spacing.item_spacing.y = 6.0;
             ctx.set_style(override_style);
 
             for node in &mut self.code_nodes {
@@ -380,25 +380,38 @@ impl App for MyApp {
                                         .text_color(egui::Color32::WHITE),
                                 );
 
-                                if ui.button("Lock").clicked() {
-                                    node.locked = true;
-                                    if let Some(project_root) = &self.project_root {
-                                        let full_path = project_root.join(&node.file_path);
-                                        if let Ok(contents) = fs::read_to_string(&full_path) {
-                                            let snippet_lines: Vec<_> =
-                                                node.code.lines().map(str::trim_end).collect();
-                                            let file_lines: Vec<_> =
-                                                contents.lines().map(str::trim_end).collect();
-                                            let snippet_len = snippet_lines.len();
+if ui.button("Lock").clicked() {
+    node.locked = true;
 
-                                            node.line_offset = file_lines
-                                                .windows(snippet_len)
-                                                .position(|window| window == snippet_lines)
-                                                .map(|i| i + 1);
-                                        }
-                                    }
-                                }
-                            }
+    if let Some(project_root) = &self.project_root {
+        let full_path = project_root.join(&node.file_path);
+        if let Ok(contents) = fs::read_to_string(&full_path) {
+            let snippet_raw = node.code.replace("\r\n", "\n");
+            let snippet = snippet_raw.trim_end();
+            let file = contents.replace("\r\n", "\n");
+
+//            println!("Searching for snippet:\n-----\n{snippet}\n-----\nIn file: {:?}", full_path);
+
+            node.line_offset = file
+                .lines()
+                .collect::<Vec<_>>()
+                .windows(snippet.lines().count())
+                .position(|window| {
+                    window.join("\n").trim_end() == snippet
+                })
+                .map(|i| i + 1);
+
+//            if let Some(offset) = node.line_offset {
+//                println!("Match found at line: {}", offset);
+//            } else {
+//                println!("No match found.");
+//            }
+//        } else {
+//            println!("Could not read file: {:?}", full_path);
+        }
+    }
+}
+                           }
                         });
                 });
             }
