@@ -58,6 +58,16 @@ struct Stroke {
     thickness: f32,
 }
 
+// Snapshot structure for undo/redo.
+#[derive(Clone)]
+struct ProjectSnapshot {
+    note_nodes: Vec<NoteNode>,
+    code_nodes: Vec<CodeNode>,
+    connections: Vec<NodeConnection>,
+    zoom: f32,
+    offset: egui::Vec2,
+}
+
 struct MyApp {
     zoom: f32,
     offset: egui::Vec2,
@@ -66,18 +76,23 @@ struct MyApp {
     tools_open: bool,
     next_note_id: usize,
     note_nodes: Vec<NoteNode>,
-    selected_node: Option<usize>,
+    code_nodes: Vec<CodeNode>,
+    connections: Vec<NodeConnection>,
     marker_active: bool,
     eraser_active: bool,
     current_stroke: Option<Stroke>,
     strokes: Vec<Stroke>,
-    code_nodes: Vec<CodeNode>,
     project_root: Option<std::path::PathBuf>,
-
     // Connection-related fields
-    connections: Vec<NodeConnection>,
     arrow_connection_active: bool,
     connection_start: Option<(usize, NodeType, Side)>,
+    // Undo/Redo stacks
+    undo_stack: Vec<ProjectSnapshot>,
+    redo_stack: Vec<ProjectSnapshot>,
+    // Home screen state
+    home_screen: bool,
+    // Node selection (for floating menus)
+    selected_node: Option<usize>,
 }
 
 impl Default for MyApp {
@@ -88,18 +103,60 @@ impl Default for MyApp {
             dragging: false,
             drag_start: egui::Pos2::ZERO,
             tools_open: false,
-            next_note_id: 0,
+            next_note_id: 1,
             note_nodes: Vec::new(),
-            selected_node: None,
+            code_nodes: Vec::new(),
+            connections: Vec::new(),
             marker_active: false,
             eraser_active: false,
             current_stroke: None,
             strokes: Vec::new(),
-            code_nodes: Vec::new(),
             project_root: None,
-            connections: Vec::new(),
             arrow_connection_active: false,
             connection_start: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            home_screen: true,
+            selected_node: None,
+        }
+    }
+}
+
+impl MyApp {
+    fn take_snapshot(&self) -> ProjectSnapshot {
+        ProjectSnapshot {
+            note_nodes: self.note_nodes.clone(),
+            code_nodes: self.code_nodes.clone(),
+            connections: self.connections.clone(),
+            zoom: self.zoom,
+            offset: self.offset,
+        }
+    }
+
+    fn restore_snapshot(&mut self, snapshot: ProjectSnapshot) {
+        self.note_nodes = snapshot.note_nodes;
+        self.code_nodes = snapshot.code_nodes;
+        self.connections = snapshot.connections;
+        self.zoom = snapshot.zoom;
+        self.offset = snapshot.offset;
+    }
+
+    fn record_state(&mut self) {
+        self.undo_stack.push(self.take_snapshot());
+        self.redo_stack.clear();
+    }
+
+    fn undo(&mut self) {
+        if let Some(snapshot) = self.undo_stack.pop() {
+            self.redo_stack.push(self.take_snapshot());
+            self.restore_snapshot(snapshot);
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(snapshot) = self.redo_stack.pop() {
+            self.undo_stack.push(self.take_snapshot());
+            self.restore_snapshot(snapshot);
         }
     }
 }
@@ -161,10 +218,7 @@ fn connection_point(
         }
         Side::Bottom => {
             let fraction = (arrow_index + 1) as f32 / (total as f32 + 1.0);
-            egui::pos2(
-                node_pos.x + node_size.x * fraction,
-                node_pos.y + node_size.y,
-            )
+            egui::pos2(node_pos.x + node_size.x * fraction, node_pos.y + node_size.y)
         }
         Side::Left => {
             let fraction = (arrow_index + 1) as f32 / (total as f32 + 1.0);
@@ -172,10 +226,7 @@ fn connection_point(
         }
         Side::Right => {
             let fraction = (arrow_index + 1) as f32 / (total as f32 + 1.0);
-            egui::pos2(
-                node_pos.x + node_size.x,
-                node_pos.y + node_size.y * fraction,
-            )
+            egui::pos2(node_pos.x + node_size.x, node_pos.y + node_size.y * fraction)
         }
     }
 }
@@ -192,7 +243,7 @@ fn get_arrow_index(
     let mut index = 0;
     for conn in connections {
         if conn.start_node_id == node_id && conn.start_side == side {
-            if (conn as *const _) == (current as *const _) {
+            if std::ptr::eq(conn, current) {
                 index = count;
             }
             count += 1;
@@ -211,7 +262,39 @@ impl App for MyApp {
             extreme_bg_color: egui::Color32::from_rgb(40, 44, 52),
             ..Default::default()
         });
+        // HOME SCREEN
+        if self.home_screen {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.heading("Welcome to CnF-Infinity");
+                    ui.add_space(20.0);
+                    if ui.button("Create").clicked() {
+                        // Clear any previous state.
+                        self.note_nodes.clear();
+                        self.code_nodes.clear();
+                        self.connections.clear();
+                        self.strokes.clear();
+                        self.marker_active = false;
+                        self.eraser_active = false;
+                        self.arrow_connection_active = false;
+                        self.connection_start = None;
+                        self.selected_node = None;
+                        self.zoom = 2.0;
+                        self.offset = egui::Vec2::ZERO;
+                        self.undo_stack.clear();
+                        self.redo_stack.clear();
+                        self.record_state();
+                        self.home_screen = false;
+                    }
+                    if ui.button("Open").clicked() {
+                        // For now, Open does nothing.
+                    }
+                });
+            });
+            return;
+        }
 
+        // Canvas View
         egui::CentralPanel::default().show(ctx, |ui| {
             let response = ui.interact(
                 ui.max_rect(),
@@ -238,26 +321,20 @@ impl App for MyApp {
             for x in (start_x as i32..=end_x as i32).step_by(spacing as usize) {
                 let x = x as f32;
                 painter.line_segment(
-                    [
-                        egui::pos2(x, top_left.y) + self.offset,
-                        egui::pos2(x, bottom_right.y) + self.offset,
-                    ],
+                    [egui::pos2(x, top_left.y) + self.offset, egui::pos2(x, bottom_right.y) + self.offset],
                     stroke,
                 );
             }
             for y in (start_y as i32..=end_y as i32).step_by(spacing as usize) {
                 let y = y as f32;
                 painter.line_segment(
-                    [
-                        egui::pos2(top_left.x, y) + self.offset,
-                        egui::pos2(bottom_right.x, y) + self.offset,
-                    ],
+                    [egui::pos2(top_left.x, y) + self.offset, egui::pos2(bottom_right.x, y) + self.offset],
                     stroke,
                 );
             }
 
+            // Render Connections (same as before).
             for connection in &self.connections {
-                // Create fallback nodes that live long enough.
                 let fallback_note = NoteNode {
                     id: 0,
                     position: egui::pos2(0.0, 0.0),
@@ -277,53 +354,34 @@ impl App for MyApp {
                     line_offset: None,
                 };
 
-                // Get start node's position and size.
                 let (start_pos, start_size) = if connection.start_node_type == NodeType::Note {
-                    let node = self
-                        .note_nodes
+                    let node = self.note_nodes
                         .iter()
                         .find(|n| n.id == connection.start_node_id)
                         .unwrap_or(&fallback_note);
-                    (
-                        (node.position * self.zoom) + self.offset,
-                        node.size * self.zoom,
-                    )
+                    (((node.position * self.zoom) + self.offset), node.size * self.zoom)
                 } else {
-                    let node = self
-                        .code_nodes
+                    let node = self.code_nodes
                         .iter()
                         .find(|n| n.id == connection.start_node_id)
                         .unwrap_or(&fallback_code);
-                    (
-                        (node.position * self.zoom) + self.offset,
-                        node.size * self.zoom,
-                    )
+                    (((node.position * self.zoom) + self.offset), node.size * self.zoom)
                 };
 
-                // Get end node's position and size.
                 let (end_pos, end_size) = if connection.end_node_type == NodeType::Note {
-                    let node = self
-                        .note_nodes
+                    let node = self.note_nodes
                         .iter()
                         .find(|n| n.id == connection.end_node_id)
                         .unwrap_or(&fallback_note);
-                    (
-                        (node.position * self.zoom) + self.offset,
-                        node.size * self.zoom,
-                    )
+                    (((node.position * self.zoom) + self.offset), node.size * self.zoom)
                 } else {
-                    let node = self
-                        .code_nodes
+                    let node = self.code_nodes
                         .iter()
                         .find(|n| n.id == connection.end_node_id)
                         .unwrap_or(&fallback_code);
-                    (
-                        (node.position * self.zoom) + self.offset,
-                        node.size * self.zoom,
-                    )
+                    (((node.position * self.zoom) + self.offset), node.size * self.zoom)
                 };
 
-                // Compute distributed connection points.
                 let (start_index, total_start) = get_arrow_index(
                     &self.connections,
                     connection.start_node_id,
@@ -343,17 +401,20 @@ impl App for MyApp {
                     connection.end_side,
                     connection,
                 );
-                let end_connection_point =
-                    connection_point(end_pos, end_size, connection.end_side, end_index, total_end);
+                let end_connection_point = connection_point(
+                    end_pos,
+                    end_size,
+                    connection.end_side,
+                    end_index,
+                    total_end,
+                );
 
-                // Compute control points with perpendicular offsets so the curve bends away from the nodes.
                 let d = end_connection_point - start_connection_point;
                 let normal_start = side_normal(connection.start_side);
                 let normal_end = side_normal(connection.end_side);
-                let offset_distance = 50.0; // Adjust for desired curvature.
+                let offset_distance = 50.0;
                 let control1 = start_connection_point + d * 0.3 + normal_start * offset_distance;
                 let control2 = start_connection_point + d * 0.7 + normal_end * offset_distance;
-
                 let bezier_points = compute_cubic_bezier_points(
                     start_connection_point,
                     control1,
@@ -366,67 +427,36 @@ impl App for MyApp {
                         painter.line_segment([*p1, *p2], egui::Stroke::new(2.0, connection.color));
                     }
                 }
-
-                // Draw arrowhead at the end.
                 let arrow_head_size = 10.0;
                 let last_segment_dir = (end_connection_point - control2).normalized();
                 let perp = egui::vec2(-last_segment_dir.y, last_segment_dir.x);
-                let arrow_left = end_connection_point - last_segment_dir * arrow_head_size
-                    + perp * arrow_head_size * 0.5;
-                let arrow_right = end_connection_point
-                    - last_segment_dir * arrow_head_size
-                    - perp * arrow_head_size * 0.5;
-                painter.line_segment(
-                    [end_connection_point, arrow_left],
-                    egui::Stroke::new(2.0, connection.color),
-                );
-                painter.line_segment(
-                    [end_connection_point, arrow_right],
-                    egui::Stroke::new(2.0, connection.color),
-                );
+                let arrow_left = end_connection_point - last_segment_dir * arrow_head_size + perp * arrow_head_size * 0.5;
+                let arrow_right = end_connection_point - last_segment_dir * arrow_head_size - perp * arrow_head_size * 0.5;
+                painter.line_segment([end_connection_point, arrow_left], egui::Stroke::new(2.0, connection.color));
+                painter.line_segment([end_connection_point, arrow_right], egui::Stroke::new(2.0, connection.color));
             }
 
-            // -------------------- Temporary Arrow (Arrow in Progress) --------------------
+            // Temporary Arrow (in progress)
             if self.arrow_connection_active {
                 if let Some((start_id, start_type, start_side)) = self.connection_start {
-                    // Get start node data.
                     let (start_pos, start_size) = if start_type == NodeType::Note {
                         let node = self.note_nodes.iter().find(|n| n.id == start_id).unwrap();
-                        (
-                            (node.position * self.zoom) + self.offset,
-                            node.size * self.zoom,
-                        )
+                        (((node.position * self.zoom) + self.offset), node.size * self.zoom)
                     } else {
                         let node = self.code_nodes.iter().find(|n| n.id == start_id).unwrap();
-                        (
-                            (node.position * self.zoom) + self.offset,
-                            node.size * self.zoom,
-                        )
+                        (((node.position * self.zoom) + self.offset), node.size * self.zoom)
                     };
-                    // For temporary arrow, use the center of the selected side.
-                    let start_connection_point =
-                        connection_point(start_pos, start_size, start_side, 0, 1);
+                    let start_connection_point = connection_point(start_pos, start_size, start_side, 0, 1);
                     if let Some(pointer_pos) = ctx.input(|i| i.pointer.interact_pos()) {
                         let d = pointer_pos - start_connection_point;
                         let normal_start = side_normal(start_side);
                         let offset_distance = 50.0;
-                        let control1 =
-                            start_connection_point + d * 0.3 + normal_start * offset_distance;
-                        let control2 =
-                            start_connection_point + d * 0.7 + normal_start * offset_distance;
-                        let temp_points = compute_cubic_bezier_points(
-                            start_connection_point,
-                            control1,
-                            control2,
-                            pointer_pos,
-                            30,
-                        );
+                        let control1 = start_connection_point + d * 0.3 + normal_start * offset_distance;
+                        let control2 = start_connection_point + d * 0.7 + normal_start * offset_distance;
+                        let temp_points = compute_cubic_bezier_points(start_connection_point, control1, control2, pointer_pos, 30);
                         for window in temp_points.windows(2) {
                             if let [p1, p2] = window {
-                                painter.line_segment(
-                                    [*p1, *p2],
-                                    egui::Stroke::new(2.0, egui::Color32::LIGHT_BLUE),
-                                );
+                                painter.line_segment([*p1, *p2], egui::Stroke::new(2.0, egui::Color32::LIGHT_BLUE));
                             }
                         }
                     }
@@ -459,9 +489,7 @@ impl App for MyApp {
                         let canvas_pos = (pos - self.offset) / self.zoom;
                         let threshold = 10.0 / self.zoom;
                         for stroke in &mut self.strokes {
-                            stroke
-                                .points
-                                .retain(|&p| p.distance(canvas_pos) >= threshold);
+                            stroke.points.retain(|&p| p.distance(canvas_pos) >= threshold);
                         }
                         self.strokes.retain(|s| s.points.len() > 1);
                     }
@@ -470,31 +498,25 @@ impl App for MyApp {
 
             // Draw Strokes.
             for stroke in &self.strokes {
-                for w in stroke.points.windows(2) {
-                    if let [a, b] = w {
+                for window in stroke.points.windows(2) {
+                    if let [a, b] = window {
                         let a = (*a) * self.zoom + self.offset;
                         let b = (*b) * self.zoom + self.offset;
-                        painter.line_segment(
-                            [a, b],
-                            egui::Stroke::new(stroke.thickness * self.zoom, stroke.color),
-                        );
+                        painter.line_segment([a, b], egui::Stroke::new(stroke.thickness * self.zoom, stroke.color));
                     }
                 }
             }
             if let Some(stroke) = &self.current_stroke {
-                for w in stroke.points.windows(2) {
-                    if let [a, b] = w {
+                for window in stroke.points.windows(2) {
+                    if let [a, b] = window {
                         let a = (*a) * self.zoom + self.offset;
                         let b = (*b) * self.zoom + self.offset;
-                        painter.line_segment(
-                            [a, b],
-                            egui::Stroke::new(stroke.thickness * self.zoom, stroke.color),
-                        );
+                        painter.line_segment([a, b], egui::Stroke::new(stroke.thickness * self.zoom, stroke.color));
                     }
                 }
             }
 
-            // Arrow Connection Logic.
+                   // Arrow Connection Logic.
             if self.arrow_connection_active {
                 // Helper function to determine closest side of a node.
                 fn determine_closest_side(
@@ -621,6 +643,7 @@ impl App for MyApp {
                 self.zoom = self.zoom.clamp(0.4, 4.0);
             }
 
+
             // Note Nodes Rendering.
             let mut i = 0;
             while i < self.note_nodes.len() {
@@ -639,8 +662,6 @@ impl App for MyApp {
                 if note.is_dragging {
                     note.position += interact.drag_delta() / self.zoom;
                 }
-
-                // In the note node rendering block:
                 ui.allocate_ui_at_rect(rect, |ui| {
                     egui::Frame::NONE
                         .fill(egui::Color32::from_rgb(32, 37, 43))
@@ -658,9 +679,6 @@ impl App for MyApp {
                                 }
                             });
                             if note.locked {
-                                // Render a read-only text area.
-                                // Note: interactive(false) disables editing. Depending on egui's version,
-                                // this may disable text selection; you may need a custom solution if selection is required.
                                 ui.add(
                                     egui::TextEdit::multiline(&mut note.text)
                                         .font(font_id.clone())
@@ -678,22 +696,13 @@ impl App for MyApp {
                                             .background_color(egui::Color32::from_rgb(32, 37, 43))
                                             .text_color(egui::Color32::from_rgb(187, 192, 206)),
                                     );
-                                    // Lock button at the bottom right.
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            if ui
-                                                .button("Lock")
-                                                .on_hover_text("Lock Note")
-                                                .clicked()
-                                            {
-                                                note.locked = true;
-                                            }
-                                        },
-                                    );
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button("Lock").on_hover_text("Lock Note").clicked() {
+                                            note.locked = true;
+                                        }
+                                    });
                                 });
                             }
-                            // Optional: Allow resizing via drag values.
                             ui.add(egui::DragValue::new(&mut note.size.x).range(1.0..=400.0));
                             ui.add(egui::DragValue::new(&mut note.size.y).range(1.0..=400.0));
                         });
@@ -706,10 +715,12 @@ impl App for MyApp {
                             let mut to_remove = false;
                             ui.horizontal(|ui| {
                                 if ui.button("Backward").clicked() && i > 0 {
+                                    self.record_state();
                                     self.note_nodes.swap(i, i - 1);
                                     self.selected_node = Some(i - 1);
                                 }
                                 if ui.button("Forward").clicked() && i < self.note_nodes.len() - 1 {
+                                    self.record_state();
                                     self.note_nodes.swap(i, i + 1);
                                     self.selected_node = Some(i + 1);
                                 }
@@ -718,6 +729,7 @@ impl App for MyApp {
                                 }
                             });
                             if to_remove {
+                                self.record_state();
                                 self.note_nodes.remove(i);
                                 self.selected_node = None;
                             }
@@ -726,7 +738,7 @@ impl App for MyApp {
                 i += 1;
             }
 
-            // Code Nodes Rendering using an index loop.
+                        // Code Nodes Rendering using an index loop.
             for i in 0..self.code_nodes.len() {
                 {
                     // Inner scope: mutable borrow of self.code_nodes[i].
@@ -819,7 +831,6 @@ impl App for MyApp {
                                         );
 
                                         // Reserve an exact area for the code text edit.
-                                        // Reserve an exact area for the code text edit.
                                         let (text_edit_rect, _response) = ui
                                             .allocate_exact_size(scaled_size, egui::Sense::hover());
                                         ui.put(text_edit_rect, |ui: &mut egui::Ui| {
@@ -888,10 +899,12 @@ impl App for MyApp {
                             let mut to_remove = false;
                             ui.horizontal(|ui| {
                                 if ui.button("Backward").clicked() && i > 0 {
+                                    self.record_state();
                                     self.code_nodes.swap(i, i - 1);
                                     self.selected_node = Some(i - 1 + self.note_nodes.len());
                                 }
                                 if ui.button("Forward").clicked() && i < self.code_nodes.len() - 1 {
+                                    self.record_state();
                                     self.code_nodes.swap(i, i + 1);
                                     self.selected_node = Some(i + 1 + self.note_nodes.len());
                                 }
@@ -900,6 +913,7 @@ impl App for MyApp {
                                 }
                             });
                             if to_remove {
+                                self.record_state();
                                 self.code_nodes.remove(i);
                                 self.selected_node = None;
                             }
@@ -917,73 +931,78 @@ impl App for MyApp {
             );
 
             // Tools Overlay.
-egui::Area::new("tool_overlay".into())
-    .fixed_pos(egui::pos2(30.0, 30.0))
-    .show(ctx, |ui| {
-        egui::Frame::popup(ui.style()).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("🛠 Tools").clicked() {
-                    self.tools_open = !self.tools_open;
-                }
-                if self.tools_open {
-                    if ui.button("+ Code Node").clicked() {
-                        if self.project_root.is_none() {
-                            if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                self.project_root = Some(path);
+            egui::Area::new("tool_overlay".into())
+                .fixed_pos(egui::pos2(30.0, 30.0))
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.button("🛠 Tools").clicked() {
+                                self.tools_open = !self.tools_open;
                             }
-                            if self.project_root.is_none() {
-                                return;
+                            if self.tools_open {
+                        if ui.button("Undo").clicked() {
+                            self.undo();
+                        }
+                        if ui.button("Redo").clicked() {
+                            self.redo();
+                        }
+                                if ui.button("+ Code Node").clicked() {
+                                    if self.project_root.is_none() {
+                                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                            self.project_root = Some(path);
+                                        }
+                                        if self.project_root.is_none() {
+                                            return;
+                                        }
+                                    }
+                                    let pos_offset = self.next_note_id as f32 * 20.0;
+                                    self.code_nodes.push(CodeNode {
+                                        id: self.next_note_id,
+                                        position: egui::pos2(120.0 + pos_offset, 120.0 + pos_offset),
+                                        size: egui::vec2(300.0, 40.0),
+                                        file_path: String::new(),
+                                        code: String::new(),
+                                        is_dragging: false,
+                                        locked: false,
+                                        line_offset: None,
+                                    });
+                                    self.record_state();
+                                    self.next_note_id += 1;
+                                }
+                                if ui.button("+ Note Node").clicked() {
+                                    let pos_offset = self.next_note_id as f32 * 20.0;
+                                    self.note_nodes.push(NoteNode {
+                                        id: self.next_note_id,
+                                        position: egui::pos2(100.0 + pos_offset, 100.0 + pos_offset),
+                                        size: egui::vec2(200.0, 40.0),
+                                        text: String::new(),
+                                        is_dragging: false,
+                                        locked: false,
+                                    });
+                                    self.record_state();
+                                    self.next_note_id += 1;
+                                }
+                                if ui.button("Marker").clicked() {
+                                    self.marker_active = !self.marker_active;
+                                    self.eraser_active = false;
+                                }
+                                if ui.button("Eraser").clicked() {
+                                    self.eraser_active = !self.eraser_active;
+                                    self.marker_active = false;
+                                }
+                                if ui.button("Arrow").clicked() {
+                                    self.arrow_connection_active = !self.arrow_connection_active;
+                                    if !self.arrow_connection_active {
+                                        self.connection_start = None;
+                                    }
+                                }
+                                if ui.button("Reset Zoom").clicked() {
+                                    self.zoom = 2.0;
+                                }
                             }
-                        }
-                        // Use next_note_id to calculate a stable offset.
-                        let pos_offset = self.next_note_id as f32 * 20.0;
-                        self.code_nodes.push(CodeNode {
-                            id: self.next_note_id,
-                            position: egui::pos2(120.0 + pos_offset, 120.0 + pos_offset),
-                            size: egui::vec2(300.0, 40.0),
-                            file_path: String::new(),
-                            code: String::new(),
-                            is_dragging: false,
-                            locked: false,
-                            line_offset: None,
                         });
-                        self.next_note_id += 1;
-                    }
-                    if ui.button("+ Note Node").clicked() {
-                        // Use next_note_id to calculate a stable offset.
-                        let pos_offset = self.next_note_id as f32 * 20.0;
-                        self.note_nodes.push(NoteNode {
-                            id: self.next_note_id,
-                            position: egui::pos2(100.0 + pos_offset, 100.0 + pos_offset),
-                            size: egui::vec2(200.0, 40.0),
-                            text: String::new(),
-                            is_dragging: false,
-                            locked: false,
-                        });
-                        self.next_note_id += 1;
-                    }
-                    if ui.button("Marker").clicked() {
-                        self.marker_active = !self.marker_active;
-                        self.eraser_active = false;
-                    }
-                    if ui.button("Eraser").clicked() {
-                        self.eraser_active = !self.eraser_active;
-                        self.marker_active = false;
-                    }
-                    if ui.button("Arrow").clicked() {
-                        self.arrow_connection_active = !self.arrow_connection_active;
-                        if !self.arrow_connection_active {
-                            self.connection_start = None;
-                        }
-                    }
-                    if ui.button("Reset Zoom").clicked() {
-                        self.zoom = 2.0;
-                    }
-                }
-            });
-        });
-    });
-
+                    });
+                });
         });
     }
 }
