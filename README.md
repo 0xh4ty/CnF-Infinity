@@ -1,5 +1,7 @@
 # CnF-Infinity
 
+![CnF-Infinity Screenshot](assets/cnf_infinity.png)
+
 CnF-Infinity is a Rust-based, canvas-driven application designed for managing and linking notes and code. It provides a flexible interface to create, edit, and connect nodes with arrows, annotate with marker strokes, and track changes with robust undo/redo functionality. The project state is persistently saved so that you can continue your work later.
 
 > **Inspired by [Goosecode](https://goosecode.app/)**
