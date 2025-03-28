@@ -1266,7 +1266,7 @@ impl App for MyApp {
                                     self.record_state();
                                     self.next_note_id += 1;
                                 }
-                                if ui.button("+ Note Node").clicked() {
+                                if ui.button("Note Node").clicked() {
                                     // Get the center of the visible area (in screen coordinates).
                                     let visible_center = ctx.input(|i| i.screen_rect().center());
                                     // Convert to canvas coordinates.
